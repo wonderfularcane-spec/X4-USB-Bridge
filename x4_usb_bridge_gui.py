@@ -235,13 +235,16 @@ class BridgeWindow:
                 self.log("Could not send Linux login input.")
             return
         self.log(line)
-        if "Impossible d'obtenir le shell Linux" in line or \
-                "Authentification Linux annulee" in line:
-            # Do not loop through failed logins and risk repeated attempts.
+        if "AUTH_FAILED:" in line or "Authentification Linux annulee" in line:
+            # Never try a rejected password repeatedly in the background.
             self.active = False
             self.start_button.configure(state="normal")
             self.stop_button.configure(state="disabled")
             self.status.set("Linux login failed — check credentials")
+        elif "CONSOLE_NOT_READY:" in line:
+            # After physical USB reconnection the old RAM relay may keep the
+            # Linux tty in raw mode for up to 30 seconds. Leave auto-retry on.
+            self.status.set("Linux console busy — will retry")
         elif "Tunnel actif" in line:
             self.status.set("Connected — Fluidd ready")
             self.retries = 0

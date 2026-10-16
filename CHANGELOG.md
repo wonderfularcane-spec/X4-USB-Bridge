@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.2.0-beta.3 — bidirectional reliable USB transport
+
+- Added CRC-checked serial sequencing, ACKs, and automatic retransmissions
+  for **both** PC-to-printer uploads and printer-to-PC responses.
+- Kept OrcaSlicer HTTP/WebSocket/G-code payload bytes completely unchanged:
+  transport frames differ, but there is **no G-code compression or rewriting**.
+- Isolated CH340 receive thread from frame decoding and response delivery.
+- Recover automatically from a temporarily unavailable Linux serial shell after
+  USB re-enumeration. An orphaned RAM relay can occupy the tty until its
+  heartbeat times out; retrying with bounded backoff avoids falsely treating
+  this as a rejected Linux login. Stop retries only on actual bad credentials.
+- A supervised simulated Windows worker crash on the real X4 Plus recovered
+  without manual restart after two transient console-not-ready failures.
+  Physical cable unplug/replug recovery with this correction remains to be
+  independently reconfirmed before a stable release.
+- Real Artillery Sidewinder X4 Plus tests (printer idle, no print started):
+  512 KiB, 1.25 MiB and 2 MiB files uploaded successfully through USB,
+  read back with matching SHA-256, and removed. The 2 MiB upload averaged
+  approximately 82.6 KiB/s to the Moonraker response.
+- A 5 MiB HTTP download completed without missing bytes, even after CRC
+  resynchronizations. Reliability remains experimental until long-running
+  monitoring and unplug/replug tests are performed.
+- Retained the v0.1 working baseline in the separate `main` branch.
+
 ## 0.2.0-beta.2 — experimental Windows preview (GitHub Actions dependency fix)
 
 - Portable Windows GUI with local port setup, serial-port selection and log display.

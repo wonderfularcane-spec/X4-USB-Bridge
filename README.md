@@ -2,7 +2,7 @@
 
 **Control an Artillery Sidewinder X4 Plus from OrcaSlicer using its USB-C serial connection — without Wi-Fi, LAN access or printer firmware changes.**
 
-> **Version status:** **v0.1** is the known-working Python prototype: the original tester reported a complete successful print on an X4 Plus. **v0.2.0-beta.2** adds a Windows GUI and a supervised reconnect mechanism, but physical USB unplug/replug is **not yet validated**. Do not assume v0.2 is production-ready.
+> **Version status:** **v0.1** is the known-working Python prototype: the original tester reported a complete successful print on an X4 Plus. **v0.2.0-beta.3** adds a Windows GUI and a supervised reconnect mechanism, but physical USB unplug/replug is **not yet validated**. Do not assume v0.2 is production-ready.
 
 ## Windows v0.2 portable preview (no Python required)
 
@@ -13,7 +13,7 @@
 5. Open Fluidd via the button, or use **127.0.0.1:8181** in OrcaSlicer as detailed below.
 6. The Stop button disconnects remote monitoring. A running print can continue after disconnection; do not use Stop as an emergency stop.
 
-The interface offers a status indicator, a log viewer, and recovery attempts after the serial link drops. It only reconnects to a matching USB device. Retries are rate-limited. The CLI version remains available for troubleshooting.
+The interface offers a status indicator, a log viewer, and recovery attempts after the serial link drops. It only reconnects to a matching USB device. Retries are rate-limited. If an old RAM-only printer relay still has the Linux tty in raw mode after a disconnect, the GUI waits and retries automatically rather than permanently disabling reconnection. A controlled worker-crash simulation has passed on an X4 Plus; a second physical unplug/replug test after this fix remains outstanding. The CLI version remains available for troubleshooting.
 
 **Important:** the GUI must be running to manage reconnections. When it is closed, the link stops. A printer on an unexpected Linux login prompt may require manual credentials; the GUI prompts without storing them.
 
@@ -39,7 +39,7 @@ nginx :80 -> Fluidd / Moonraker :7125
 
 The bridge runs on Windows. It launches a small in-memory Python relay through the existing printer Linux console. **No firmware flash, printer-side package installation or permanent printer file changes are required.**
 
-**Data integrity:** OrcaSlicer's HTTP requests, WebSocket messages and G-code bytes are forwarded unchanged. The v0.2 beta batches existing serial packets to reduce write overhead, but never compresses, rewrites, interprets or recompresses G-code. The zlib library in the source is used only for temporary relay startup and CRC checksum calculation.
+**Data integrity:** OrcaSlicer's HTTP requests, WebSocket messages and G-code bytes are forwarded unchanged. The beta.3 serial tunnel adds sequence numbers, CRC checks, acknowledgements and automatic retransmission **in both directions**. These are transport-only frames: it never compresses, rewrites or interprets G-code. The zlib library in the source is used only for temporary relay startup and CRC checksum calculation. The older v0.1 wire protocol is unchanged on the `main` branch.
 
 ## Real-world validation (2026-10-16)
 
@@ -113,7 +113,7 @@ This checks the Linux console and internal nginx/Moonraker HTTP endpoints; it do
 
 ## Current limitations and safety
 
-- Automatic reconnect, hard disconnect recovery, prolonged usage and high-volume throughput are not yet qualified. v0.2 includes fixes for premature HTTP reply closure and serial-write overhead; these must be validated on hardware before claiming a real transfer-speed improvement. UART at 1,500,000 baud in 8N1 has an approximate physical maximum of 150 kB/s before protocol overhead, regardless of host optimizations.
+- Automatic reconnect after physical USB unplug/replug and long-term print stability still require validation. In beta.3, actual 512 KiB, 1.25 MiB and 2 MiB test uploads completed over the USB bridge with Moonraker `print=false`, verified by SHA-256 read-back and removal. The measured upload throughput reached about 82.6 KiB/s for the 2 MiB test, **not a guarantee for all files or printers**. UART at 1,500,000 baud in 8N1 has an approximate maximum of 150 kB/s before protocol overhead.
 - Disconnecting USB or stopping the bridge breaks the remote connection; it does **not** ensure that an already-started print will stop. Use printer hardware controls and supervise first prints.
 - The Windows listener binds to **127.0.0.1 only**. Other programs **on the same PC** may still access Moonraker and issue real machine commands. Do not expose port 8181 to the LAN or Internet, or use on untrusted computers.
 - Factory Linux login credentials should be changed where possible. The v0.2 GUI asks when the console requires login and does not store the value; avoid putting any credentials in issue reports or logs.
@@ -147,7 +147,7 @@ On Windows x64 with Python 3.11 and an Internet connection for build dependencie
 py tools/build_windows.py
 ~~~
 
-The script creates an isolated build environment, generates both executables, tests their startup without accessing the printer, and packages them in `dist/X4-USB-Bridge-v0.2.0-beta.2-windows-x64.zip`. Build dependencies are pinned in `build-requirements.txt`.
+The script creates an isolated build environment, generates both executables, tests their startup without accessing the printer, and packages them in `dist/X4-USB-Bridge-v0.2.0-beta.3-windows-x64.zip`. Build dependencies are pinned in `build-requirements.txt`.
 
 See [CHANGELOG.md](CHANGELOG.md), [compatibility notes](docs/COMPATIBILITY.md), and the [hardware validation checklist](docs/RELEASE_VALIDATION.md). **Do not switch from the working v0.1 during an active print.**
 

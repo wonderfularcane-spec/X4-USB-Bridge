@@ -11,9 +11,12 @@ import x4_usb_bridge as bridge
 class SerialWriteCollector:
     def __init__(self):
         self.writes = []
+        self.on_write = None
 
     def write(self, payload):
         self.writes.append(bytes(payload))
+        if self.on_write:
+            self.on_write()
         return len(payload)
 
 
@@ -33,20 +36,54 @@ class SerialTransferTests(unittest.TestCase):
             payload,
         )
 
-    def test_batched_write_count_is_lower_without_touching_payload(self):
+    def test_uplink_acks_reassemble_identical_application_bytes(self):
         sender = bridge.Session.__new__(bridge.Session)
         sender.ser = SerialWriteCollector()
         sender.stop = threading.Event()
         sender.lock = threading.Lock()
+        sender.tx_lock = threading.Lock()
+        sender.tx_seq = 0
+        sender.tx_pending_seq = 0
+        sender.tx_ack = threading.Event()
+        sender.tx_retries = 0
+        sender.ack_timeout = 0.015
+        sender.ser.on_write = sender.tx_ack.set
         body = bytes(range(256)) * 1000
         self.assertTrue(sender.send(bridge.DATA, 31, body))
-        self.assertLess(len(sender.ser.writes),
-                        (len(body) + bridge.MAX_PAYLOAD - 1) // bridge.MAX_PAYLOAD)
-        self.assertTrue(all(len(item) < 20000 for item in sender.ser.writes))
+        self.assertTrue(all(len(part) <= 2065 for part in sender.ser.writes))
         received = bridge.FrameParser().feed(b"".join(sender.ser.writes))
-        self.assertEqual(b"".join(data for _, _, data in received), body)
-        self.assertTrue(all(typ == bridge.DATA and sid == 31
+        self.assertEqual(b"".join(data[4:] for _, _, data in received), body)
+        self.assertTrue(all(typ == bridge.RDATA and sid == 31
                             for typ, sid, _ in received))
+        self.assertEqual(
+            [bridge.CRC.unpack(part[:4])[0] for _, _, part in received],
+            list(range(1, len(received) + 1)),
+        )
+
+    def test_lost_uplink_ack_retransmits_identical_frame(self):
+        sender = bridge.Session.__new__(bridge.Session)
+        sender.ser = SerialWriteCollector()
+        sender.stop = threading.Event()
+        sender.lock = threading.Lock()
+        sender.tx_lock = threading.Lock()
+        sender.tx_seq = 0
+        sender.tx_pending_seq = 0
+        sender.tx_ack = threading.Event()
+        sender.tx_retries = 0
+        sender.ack_timeout = 0.015
+
+        def lose_first_ack():
+            if len(sender.ser.writes) >= 2:
+                sender.tx_ack.set()
+
+        sender.ser.on_write = lose_first_ack
+        self.assertTrue(sender.send(bridge.DATA, 77, b"unaltered-data"))
+        self.assertEqual(sender.tx_retries, 1)
+        self.assertEqual(sender.ser.writes[0], sender.ser.writes[1])
+        self.assertEqual(
+            bridge.FrameParser().feed(sender.ser.writes[0]),
+            [(bridge.RDATA, 77, bridge.CRC.pack(1) + b"unaltered-data")],
+        )
 
     def test_data_and_close_frames_can_share_one_stream(self):
         frames = [

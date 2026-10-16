@@ -6,7 +6,7 @@
 
 Run `py -m unittest discover -s tests -v`. Required checks:
 
-- X4B1 serial data frames unchanged byte-for-byte from v0.1.
+- Full HTTP and G-code payload bytes remain unchanged. Beta.3 serial transport frames add sequence numbers and CRC/ACK retransmission in both directions; the original v0.1 framing remains available on `main`.
 - Arbitrary binary HTTP bodies remain unchanged, including a 2 MiB simulated upload.
 - `Expect: 100-continue` and `201 Created` delivered through the bridge.
 - Rejected uploads propagate HTTP `413`; lost upstream connections produce `502` rather than empty responses.
@@ -24,7 +24,7 @@ These are **not** automated because they require an operator, real electronics a
 4. Submit a small test G-code file with `print=false`. Read the file back via Moonraker and verify its SHA-256, then delete it.
 5. Try gradually larger uploads using a **slicer-generated** test file, with `print=false`: 512 KiB, 1 MiB, 2 MiB, and representative real-world size. Record HTTP status, USB bytes/sec and Moonraker response time. Do not alter the file contents.
 6. Confirm OrcaSlicer receives usable error responses on rejected files, with no changes to print-host configuration.
-7. Unplug and replug USB **while the printer is idle and cooled down**. Verify re-detection and recovery without reconnecting to unrelated serial devices.
+7. Unplug and replug USB **while the printer is idle and cooled down**. The old Linux RAM relay may take about 30 seconds to time out, so allow at least 90 seconds for bounded retries. Verify that the bridge does not disable reconnect merely because the Linux console is busy; confirm the original CH340 reappears, Fluidd and `/server/info` work, and unrelated serial devices are never selected. This exact physical test is still pending after the newest fix.
 8. Monitor a full idle period and finally supervise one representative print only after all prior checks pass.
 
 ## Rollback

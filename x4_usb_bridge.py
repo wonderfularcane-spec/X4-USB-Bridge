@@ -18,6 +18,8 @@ import threading
 import time
 import zlib
 
+from x4_remote_reliable import REMOTE_SOURCE as RELIABLE_REMOTE_SOURCE
+
 try:
     import serial
 except ImportError:
@@ -27,7 +29,7 @@ MAGIC = b"X4B1"
 HEADER = struct.Struct("!4sBII")
 CRC = struct.Struct("!I")
 MAX_PAYLOAD = 2048
-OPEN, DATA, CLOSE, PING, PONG, STOP, ERROR = range(1, 8)
+OPEN, DATA, CLOSE, PING, PONG, STOP, ERROR, RDATA, ACK = range(1, 10)
 READY = b"X4_USB_BRIDGE_READY_V1\n"
 
 # This is the *entire* printer-side component. It is launched via the existing
@@ -170,6 +172,11 @@ finally:
     except Exception:pass
 '''
 
+# The v0.3 experimental tunnel protects printer -> Windows data with
+# stop-and-wait serial acknowledgements. The v0.1 protocol and code in main
+# remain untouched. No G-code compression or HTTP body rewriting.
+REMOTE_SOURCE = RELIABLE_REMOTE_SOURCE
+
 
 def pack_frame(kind, stream_id=0, payload=b""):
     if len(payload) > MAX_PAYLOAD:
@@ -222,7 +229,7 @@ class FrameParser:
             if len(self.data) < HEADER.size:
                 return output
             _mg, kind, sid, length = HEADER.unpack(self.data[:HEADER.size])
-            if length > MAX_PAYLOAD or kind < OPEN or kind > ERROR:
+            if length > MAX_PAYLOAD or kind < OPEN or kind > ACK:
                 self.dropped += 1
                 del self.data[0]
                 continue
@@ -261,8 +268,11 @@ def shell_probe(ser):
 
 
 def login_if_needed(ser, username):
-    ser.write(b'\r')
+    # Clear any incomplete shell command left by a dropped USB session.
+    # Ctrl-U is harmless in getty and ignored by an orphan raw-mode agent.
+    ser.write(b'\x15\r')
     seen = read_for(ser, 1.2)
+    attempted_password = False
     if b'login:' not in seen.lower() and b'password:' not in seen.lower():
         ok, more = shell_probe(ser)
         if ok:
@@ -287,6 +297,7 @@ def login_if_needed(ser, username):
             password = sys.stdin.readline().rstrip('\r\n')
         if not password:
             raise RuntimeError('Authentification Linux annulee ou mot de passe vide.')
+        attempted_password = True
         ser.write(password.encode('utf-8') + b'\r')
         password = None
         read_for(ser, 2.5)
@@ -301,7 +312,12 @@ def login_if_needed(ser, username):
             return
         seen += more
     tail = seen[-600:].decode('utf-8', errors='replace')
-    raise RuntimeError("Impossible d'obtenir le shell Linux. Sortie console :\n" + tail)
+    if attempted_password:
+        raise RuntimeError('AUTH_FAILED: Identifiants Linux refuses. ' + tail)
+    # The serial port is back, but an old RAM-only relay can remain in raw
+    # terminal mode until its 30-second heartbeat timeout. This is transient
+    # and must NOT permanently disable automatic USB reconnection.
+    raise RuntimeError('CONSOLE_NOT_READY: Console Linux temporairement indisponible. ' + tail)
 
 
 def start_remote(ser):
@@ -336,24 +352,76 @@ class Session:
         self.parser = FrameParser()
         self.errors = 0
         self.pong = time.monotonic()
-        threading.Thread(target=self.reader, daemon=True, name='uart-read').start()
-        threading.Thread(target=self.heartbeat, daemon=True, name='uart-ping').start()
+        self.rx_seen_seq = 0
+        self.rx_acked_seq = 0
+        self.tx_lock = threading.Lock()
+        self.tx_seq = 0
+        self.tx_pending_seq = 0
+        self.tx_ack = threading.Event()
+        self.tx_retries = 0
+        self.ack_timeout = 1.3
+        # Read serial bytes as quickly as possible. CRC checking, decoding,
+        # client lookup and logging run on another thread to avoid keeping
+        # Windows CH340 receive buffers blocked under sustained downloads.
+        self.rx_chunks = queue.Queue(maxsize=2048)
+        threading.Thread(target=self.serial_pump, daemon=True,
+                         name='uart-raw-read').start()
+        threading.Thread(target=self.reader, daemon=True,
+                         name='uart-frame-decode').start()
+        threading.Thread(target=self.heartbeat, daemon=True,
+                         name='uart-ping').start()
 
     def send(self, kind, sid=0, data=b''):
         if self.stop.is_set():
             return False
         try:
+            if kind == DATA and data:
+                # PC -> printer payloads use the same loss-recovery protocol
+                # as printer -> PC replies. Only the serial frame changes;
+                # Moonraker and OrcaSlicer see the original bytes unchanged.
+                view = memoryview(data)
+                stride = MAX_PAYLOAD - CRC.size
+                for start in range(0, len(view), stride):
+                    with self.tx_lock:
+                        self.tx_seq = (self.tx_seq + 1) & 0xffffffff
+                        seq = self.tx_seq
+                        self.tx_pending_seq = seq
+                        self.tx_ack.clear()
+                        packet = pack_frame(
+                            RDATA, sid,
+                            CRC.pack(seq) + bytes(view[start:start + stride]),
+                        )
+                        for attempt in range(17):
+                            if self.stop.is_set():
+                                return False
+                            with self.lock:
+                                written = self.ser.write(packet)
+                            if written != len(packet):
+                                raise IOError('Short UART frame write')
+                            if self.tx_ack.wait(self.ack_timeout):
+                                break
+                            self.tx_retries += 1
+                            if self.tx_retries <= 4 or self.tx_retries % 32 == 0:
+                                print('[UART RETRY] PC->printer frame %d, '
+                                      'retry %d (total=%d)' %
+                                      (seq, attempt + 1, self.tx_retries),
+                                      flush=True)
+                        else:
+                            raise TimeoutError(
+                                'No UART ACK after 17 attempts; '
+                                'aborting link to avoid an incomplete upload'
+                            )
+                return True
             for batch in serial_batches(kind, sid, data):
                 if self.stop.is_set():
                     return False
-                # Hold the lock only for one bounded UART write. This reduces
-                # pyserial overhead but keeps the monitoring channel responsive
-                # and preserves the original byte-for-byte frame format.
                 with self.lock:
-                    self.ser.write(batch)
+                    written = self.ser.write(batch)
+                if written != len(batch):
+                    raise IOError('Short UART control write')
             return True
         except Exception as exc:
-            print('[ERREUR] Ecriture sur le port serie :', exc)
+            print('[UART ERROR] Serial transmit:', exc, flush=True)
             self.stop.set()
             return False
 
@@ -371,15 +439,80 @@ class Session:
             self.clients.pop(sid, None)
         self.send(CLOSE, sid)
 
-    def reader(self):
+    def ack_downlink(self, seq):
+        """Confirm downstream bytes were forwarded once, not merely decoded."""
+        self.rx_acked_seq = seq
+        self.send(ACK, 0, CRC.pack(seq))
+
+    def serial_pump(self):
+        """Prioritize draining CH340 bytes over decoding or logging."""
         try:
             while not self.stop.is_set():
-                data = self.ser.read(self.ser.in_waiting or 1)
-                if not data:
+                # Read immediately when a reliable 2 KiB response frame
+                # arrives. Waiting for a fixed 8 KiB would add the 100 ms
+                # serial timeout to EACH ACK round-trip and cripple throughput.
+                waiting = self.ser.in_waiting
+                chunk = self.ser.read(min(waiting, 16384) if waiting else 1)
+                if chunk:
+                    try:
+                        self.rx_chunks.put(chunk, timeout=1)
+                    except queue.Full:
+                        print('[UART ERROR] Decoder backlog exceeded safe limit.',
+                              flush=True)
+                        self.stop.set()
+                        break
+        except Exception as exc:
+            if not self.stop.is_set():
+                print('[UART ERROR] Raw serial read:', exc, flush=True)
+                self.stop.set()
+
+    def reader(self):
+        violations = 0
+        try:
+            while not self.stop.is_set():
+                try:
+                    data = self.rx_chunks.get(timeout=0.3)
+                except queue.Empty:
                     continue
-                for typ, sid, body in self.parser.feed(data):
+                before_dropped = self.parser.dropped
+                decoded = self.parser.feed(data)
+                if self.parser.dropped > before_dropped:
+                    violations += 1
+                    if violations <= 4 or violations % 32 == 0:
+                        print(
+                            '[UART WARN] CRC/framing resync: %d bytes discarded '
+                            'in %d events (large HTTP replies may be incomplete)' %
+                            (self.parser.dropped, violations),
+                            flush=True,
+                        )
+                for typ, sid, body in decoded:
                     if typ == PONG:
                         self.pong = time.monotonic()
+                    elif typ == ACK:
+                        if len(body) == CRC.size and (
+                            CRC.unpack(body)[0] == self.tx_pending_seq
+                        ):
+                            self.tx_ack.set()
+                    elif typ == RDATA:
+                        if len(body) < CRC.size:
+                            continue
+                        seq = CRC.unpack(body[:CRC.size])[0]
+                        if seq == (self.rx_seen_seq + 1) & 0xffffffff:
+                            self.rx_seen_seq = seq
+                            with self.clients_lock:
+                                channel = self.clients.get(sid)
+                            if channel is not None:
+                                # ACK only after the Windows TCP socket accepts
+                                # these bytes; keep reverse pressure bounded.
+                                channel.incoming.put((RDATA, body))
+                            else:
+                                self.ack_downlink(seq)
+                        elif seq == self.rx_acked_seq:
+                            # The sender lost the previous ACK; do not deliver
+                            # duplicate HTTP bytes, just acknowledge again.
+                            self.send(ACK, 0, CRC.pack(seq))
+                        # If this seq is still pending in a client queue,
+                        # do not ACK duplicates until sendall completes.
                     elif typ in (DATA, CLOSE, ERROR):
                         with self.clients_lock:
                             channel = self.clients.get(sid)
@@ -387,7 +520,7 @@ class Session:
                             channel.incoming.put((typ, body))
         except Exception as exc:
             if not self.stop.is_set():
-                print('[ERREUR] Lecture serie :', exc)
+                print('[UART ERROR] Frame decoder:', exc, flush=True)
         finally:
             self.stop.set()
             with self.clients_lock:
@@ -478,6 +611,14 @@ class ClientHandler(socketserver.BaseRequestHandler):
                     if first_response is None:
                         first_response = time.monotonic()
                     self.request.sendall(data)
+                elif typ == RDATA:
+                    if len(data) < CRC.size:
+                        break
+                    if first_response is None:
+                        first_response = time.monotonic()
+                    seq = CRC.unpack(data[:CRC.size])[0]
+                    self.request.sendall(data[CRC.size:])
+                    bridge.ack_downlink(seq)
                 elif typ == ERROR:
                     print('[WARN] Connexion HTTP refusee sur l\'imprimante :',
                           data.decode('utf-8', 'replace'))
@@ -574,7 +715,7 @@ def main():
     ser = None
     bridge = None
     try:
-        print('X4 USB Bridge v0.2-dev - prototype experimental')
+        print('X4 USB Bridge v0.2.0-beta.3 - bidirectional UART recovery (experimental)')
         print('Fermer PuTTY et HW VSP3 avant de lancer la connexion COM.')
         ser = serial.Serial(args.com, baudrate=args.baud, timeout=0.1,
                             write_timeout=8, xonxoff=False, rtscts=False, dsrdtr=False)
