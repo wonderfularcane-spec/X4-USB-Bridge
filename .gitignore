@@ -1,0 +1,28 @@
+# Python caches and environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# User settings and local runtime artifacts
+.vscode/
+.idea/
+.env
+.env.*
+*.log
+logs/
+captures/
+tmp/
+
+# G-code and print models must not be committed accidentally
+*.gcode
+*.bgcode
+*.3mf
+*.pcap
+*.pcapng
