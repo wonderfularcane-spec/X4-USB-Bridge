@@ -506,7 +506,10 @@ class ClientHandler(socketserver.BaseRequestHandler):
             running.clear()
             bridge.remove(sid)
             try:
-                self.request.shutdown(socket.SHUT_RDWR)
+                # Shut down only the response direction. Forcing SHUT_RDWR
+                # can reset a socket with queued request bytes on Windows,
+                # hiding an upstream HTTP error (e.g. 502/413) from curl.
+                self.request.shutdown(socket.SHUT_WR)
             except OSError:
                 pass
             reader.join(timeout=0.2)

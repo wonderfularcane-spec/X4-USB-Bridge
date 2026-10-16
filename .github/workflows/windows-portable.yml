@@ -17,6 +17,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Install runtime dependencies for offline tests
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
       - name: Offline protocol and reconnect tests
         run: python -m unittest discover -s tests -v
       - name: Build portable GUI and worker
@@ -25,5 +27,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: X4-USB-Bridge-Windows-x64
-          path: dist/X4-USB-Bridge-v0.2.0-beta.1-windows-x64.zip
+          path: dist/X4-USB-Bridge-v0.2.0-beta.2-windows-x64.zip
           if-no-files-found: error

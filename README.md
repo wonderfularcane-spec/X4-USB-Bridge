@@ -2,7 +2,7 @@
 
 **Control an Artillery Sidewinder X4 Plus from OrcaSlicer using its USB-C serial connection — without Wi-Fi, LAN access or printer firmware changes.**
 
-> **Version status:** **v0.1** is the known-working Python prototype: the original tester reported a complete successful print on an X4 Plus. **v0.2.0-beta.1** adds a Windows GUI and a supervised reconnect mechanism, but physical USB unplug/replug is **not yet validated**. Do not assume v0.2 is production-ready.
+> **Version status:** **v0.1** is the known-working Python prototype: the original tester reported a complete successful print on an X4 Plus. **v0.2.0-beta.2** adds a Windows GUI and a supervised reconnect mechanism, but physical USB unplug/replug is **not yet validated**. Do not assume v0.2 is production-ready.
 
 ## Windows v0.2 portable preview (no Python required)
 
@@ -147,7 +147,7 @@ On Windows x64 with Python 3.11 and an Internet connection for build dependencie
 py tools/build_windows.py
 ~~~
 
-The script creates an isolated build environment, generates both executables, tests their startup without accessing the printer, and packages them in `dist/X4-USB-Bridge-v0.2.0-beta.1-windows-x64.zip`. Build dependencies are pinned in `build-requirements.txt`.
+The script creates an isolated build environment, generates both executables, tests their startup without accessing the printer, and packages them in `dist/X4-USB-Bridge-v0.2.0-beta.2-windows-x64.zip`. Build dependencies are pinned in `build-requirements.txt`.
 
 See [CHANGELOG.md](CHANGELOG.md), [compatibility notes](docs/COMPATIBILITY.md), and the [hardware validation checklist](docs/RELEASE_VALIDATION.md). **Do not switch from the working v0.1 during an active print.**
 

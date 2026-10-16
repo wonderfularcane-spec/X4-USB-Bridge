@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0-beta.1 — experimental Windows preview
+## 0.2.0-beta.2 — experimental Windows preview (GitHub Actions dependency fix)
 
 - Portable Windows GUI with local port setup, serial-port selection and log display.
 - A separate CLI bridge worker to keep the GUI responsive.
@@ -18,8 +18,9 @@
 - Split USB timing from HTTP response waiting in logs, so apparent slow uploads
   can be diagnosed without confusing serialization with Moonraker processing.
 - If the upstream connection closes before delivering a response, return a
-  clear HTTP 502 rather than an empty reply (curl 52). Existing HTTP errors
-  such as 413 are passed through unchanged, as are interim 100 Continue replies.
+  clear HTTP 502 rather than an empty reply (curl 52). Use graceful TCP
+  write-side shutdown on Windows to avoid hiding the error with a socket reset.
+  Existing HTTP errors such as 413 remain unchanged, as do interim 100 Continue replies.
 - These measurements do **not** prove Moonraker saved a file.
 - Offline protocol, packaging, upload-integrity and reconnect tests.
 - Windows portable bundle with two executables; **no Python installation required** for end users.
