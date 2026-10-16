@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.2.0-beta.4 — guarded USB reconnect watchdog (offline-validated)
+
+- Detect a silently vanished CH340 even if the Windows worker process remains
+  alive. Require USB absence for five seconds before gracefully restarting.
+- Monitor valid framed UART replies via a low-noise worker heartbeat; after
+  50 seconds of confirmed silence, restart the owned worker with bounded retry.
+- Catch transient Windows serial-enumeration exceptions so the Tkinter event
+  loop always continues.
+- Stop only this GUI's worker process tree (including PyInstaller child), never
+  another serial application or printer firmware process.
+- Refuse an automatically reassigned COM port with mismatched USB identity;
+  explain why the user must manually confirm a changed location.
+- Avoid sending STOP to stdin while the worker might still be reading a Linux
+  password.
+- Added offline tests for serial disappearance, short device blips, worker
+  stalls, unknown USB identities, and process-tree cleanup. The physical
+  USB unplug/replug behaviour of beta.4 is **not yet validated on hardware**.
+- No G-code compression or rewriting; the existing bidirectional ACK/CRC
+  transport from beta.3 is unchanged.
+
 ## 0.2.0-beta.3 — bidirectional reliable USB transport
 
 - Added CRC-checked serial sequencing, ACKs, and automatic retransmissions

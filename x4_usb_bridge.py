@@ -342,8 +342,11 @@ def start_remote(ser):
 
 
 class Session:
-    def __init__(self, ser):
+    def __init__(self, ser, report_health=False):
         self.ser = ser
+        self.report_health = report_health
+        self.have_rx = False
+        self.last_rx = time.monotonic()
         self.lock = threading.Lock()
         self.clients = {}
         self.clients_lock = threading.Lock()
@@ -476,6 +479,9 @@ class Session:
                     continue
                 before_dropped = self.parser.dropped
                 decoded = self.parser.feed(data)
+                if decoded:
+                    self.have_rx = True
+                    self.last_rx = time.monotonic()
                 if self.parser.dropped > before_dropped:
                     violations += 1
                     if violations <= 4 or violations % 32 == 0:
@@ -534,6 +540,12 @@ class Session:
                 print('[ERREUR] Le relais ne repond plus (liaison serie interrompue).')
                 self.stop.set()
                 break
+            # GUI-only health output; never include printer credentials, URLs
+            # or print-job content. Any valid framed reply/ACK/PONG qualifies.
+            if self.report_health and self.have_rx and (
+                time.monotonic() - self.last_rx < 12
+            ):
+                print('[X4_HEALTH_OK]', flush=True)
 
     def close(self):
         try:
@@ -728,7 +740,7 @@ def main():
             print('[READ-ONLY] Reponse Linux :', read_for(ser, 9).decode('utf-8','replace')[-1200:])
             return 0
         start_remote(ser)
-        bridge = Session(ser)
+        bridge = Session(ser, report_health=args.control_stdin)
         with LocalServer(('127.0.0.1', args.port), ClientHandler) as server:
             server.bridge = bridge
             print('[OK] Tunnel actif : http://127.0.0.1:%d' % args.port, flush=True)

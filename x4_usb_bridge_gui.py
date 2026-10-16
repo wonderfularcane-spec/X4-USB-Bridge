@@ -13,7 +13,8 @@ from tkinter import messagebox, simpledialog, ttk
 
 from serial.tools import list_ports
 
-from x4_bridge_ports import port_identity, retry_seconds, select_com_port
+from x4_bridge_ports import (port_identity, reconnect_mismatch,
+                             retry_seconds, select_com_port)
 
 FROZEN = bool(getattr(sys, "frozen", False))
 HERE = Path(sys.executable if FROZEN else __file__).resolve().parent
@@ -52,6 +53,33 @@ def http_port_in_use(port):
         return False
 
 
+def terminate_owned_worker(proc):
+    """End only the GUI-created worker and its own child processes.
+
+    PyInstaller one-file mode may spawn a bootloader child which keeps COM3
+    open even after terminating the parent. taskkill /T targets that tree;
+    never use image-name-wide taskkill or touch unrelated Python processes.
+    """
+    if proc is None or proc.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            result = subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                check=False, timeout=8, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if result.returncode == 0:
+                return
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    try:
+        proc.terminate()
+    except OSError:
+        pass
+
+
 class BridgeWindow:
     def __init__(self, root):
         self.root = root
@@ -73,6 +101,13 @@ class BridgeWindow:
         self.stopping_at = 0
         self.retries = 0
         self.retry_at = 0
+        self.last_usb_poll = 0.0
+        self.usb_missing_since = None
+        self.restart_requested_at = None
+        self.connected_at = None
+        self.last_worker_health = None
+        self.last_usb_error_log = 0.0
+        self.last_port_warning = None
         self.lines = queue.Queue()
 
         parent = ttk.Frame(root, padding=16)
@@ -125,8 +160,26 @@ class BridgeWindow:
         self.logbox.see("end")
         self.logbox.configure(state="disabled")
 
+    def _list_usb_ports(self):
+        """USB re-enumeration may briefly fail on Windows during unplug/replug.
+
+        Never let an OS enumeration exception stop Tkinter's repeating tick:
+        that would silently disable all future auto-reconnect attempts.
+        """
+        try:
+            return list(list_ports.comports())
+        except Exception as exc:
+            now = time.monotonic()
+            if now - self.last_usb_error_log > 10:
+                self.log("USB detection temporarily unavailable: " +
+                         type(exc).__name__ + " — retrying")
+                self.last_usb_error_log = now
+            return None
+
     def refresh(self):
-        ports = list(list_ports.comports())
+        ports = self._list_usb_ports()
+        if ports is None:
+            return
         options = {AUTO: None}
         for p in sorted(ports, key=lambda item: item.device):
             options[p.device + " | " + (p.description or "Serial")] = p.device
@@ -145,6 +198,10 @@ class BridgeWindow:
     def start(self):
         if self.active:
             return
+        self.usb_missing_since = None
+        self.restart_requested_at = None
+        self.last_usb_poll = 0.0
+        self.last_port_warning = None
         try:
             self.settings()
         except ValueError:
@@ -196,6 +253,10 @@ class BridgeWindow:
             self.schedule_retry()
             return
         self.started = time.monotonic()
+        self.connected_at = None
+        self.last_worker_health = None
+        self.restart_requested_at = None
+        self.usb_missing_since = None
         self.status.set("Connecting over " + port)
         self.log("Launching bridge on " + port)
         threading.Thread(target=self.reader, args=(self.proc,), daemon=True).start()
@@ -209,6 +270,11 @@ class BridgeWindow:
 
     def process_line(self, proc, line):
         if proc is not self.proc:
+            return
+        if line == "[X4_HEALTH_OK]":
+            # The worker sends this only after receiving valid UART frames.
+            # Update the watchdog without filling the GUI log every 5s.
+            self.last_worker_health = time.monotonic()
             return
         if line == "[X4_AUTH_REQUIRED]":
             answer = simpledialog.askstring(
@@ -247,6 +313,8 @@ class BridgeWindow:
             self.status.set("Linux console busy — will retry")
         elif "Tunnel actif" in line:
             self.status.set("Connected — Fluidd ready")
+            self.connected_at = time.monotonic()
+            self.last_worker_health = self.connected_at
             self.retries = 0
 
     def schedule_retry(self):
@@ -256,6 +324,52 @@ class BridgeWindow:
         self.status.set("Reconnecting in " + str(delay) + " seconds")
         self.log("Disconnected. Retrying in " + str(delay) + " seconds.")
 
+    def _request_worker_restart(self, reason):
+        """Only stop this GUI's child, never other services or printer jobs."""
+        proc = self.proc
+        if proc is None or proc.poll() is not None or self.restart_requested_at:
+            return
+        self.log(reason + ". Closing USB worker for automatic recovery.")
+        self.status.set("USB disconnected — restarting worker")
+        self.restart_requested_at = time.monotonic()
+        # This command is read by our CLI worker's --control-stdin loop.
+        # Do not send it while the worker might be reading Linux credentials.
+        if self.connected_at is not None:
+            try:
+                proc.stdin.write("STOP\n")
+                proc.stdin.flush()
+                return
+            except (OSError, ValueError, AttributeError):
+                pass
+        terminate_owned_worker(proc)
+
+    def _poll_connected_usb(self, now):
+        """Catch silent CH340 disappearance even if the worker has hung.
+
+        A transient enumeration exception is not proof the printer has gone;
+        never kill the connection on a single missed Windows USB scan.
+        """
+        if now - self.last_usb_poll < 1.5:
+            return
+        self.last_usb_poll = now
+        devices = self._list_usb_ports()
+        if devices is None:
+            return
+        found = select_com_port(devices, self.selected, self.identity)
+        if found is not None:
+            self.usb_missing_since = None
+            self.last_port_warning = None
+            return
+        mismatch = reconnect_mismatch(devices, self.identity)
+        if mismatch and mismatch != self.last_port_warning:
+            self.log(mismatch)
+            self.last_port_warning = mismatch
+        if self.usb_missing_since is None:
+            self.usb_missing_since = now
+            self.log("Selected USB printer temporarily absent; waiting for return")
+        elif now - self.usb_missing_since >= 5:
+            self._request_worker_restart("Selected CH340 absent for 5 seconds")
+
     def tick(self):
         for _ in range(100):
             try:
@@ -263,30 +377,67 @@ class BridgeWindow:
             except queue.Empty:
                 break
             self.process_line(proc, line)
+        now = time.monotonic()
         if self.proc is not None:
             code = self.proc.poll()
             if code is not None:
                 self.log("Bridge process exited, code " + str(code))
                 self.proc = None
                 self.stopping_at = 0
+                self.restart_requested_at = None
+                self.connected_at = None
+                self.last_worker_health = None
+                self.usb_missing_since = None
                 if self.active:
                     self.schedule_retry()
                 else:
                     self.status.set("Stopped")
-            elif not self.active and self.stopping_at and time.monotonic() - self.stopping_at > 10:
-                self.log("Graceful stop timed out; ending child process.")
-                self.proc.terminate()
-                self.stopping_at = 0
+            elif self.restart_requested_at is not None:
+                if now - self.restart_requested_at > 10:
+                    self.log("USB worker did not stop gracefully; ending its process tree.")
+                    terminate_owned_worker(self.proc)
+                    self.restart_requested_at = None
+            elif not self.active and self.stopping_at:
+                if now - self.stopping_at > 10:
+                    self.log("Graceful stop timed out; ending only the owned worker.")
+                    terminate_owned_worker(self.proc)
+                    self.stopping_at = 0
+            elif self.active and self.connected_at is not None:
+                self._poll_connected_usb(now)
+                # Some Windows USB driver failures leave the worker process
+                # alive even after its serial handle stops receiving bytes.
+                # The worker's heartbeat reports only valid inbound UART data.
+                # Wait generously to avoid mistaking normal long uploads for
+                # disconnections, then restart only this GUI's worker.
+                if (self.restart_requested_at is None
+                        and self.last_worker_health is not None
+                        and now - self.last_worker_health > 50):
+                    self._request_worker_restart(
+                        "No valid printer UART heartbeat for 50 seconds"
+                    )
 
-        if self.active and self.proc is None and time.monotonic() >= self.retry_at:
-            port = select_com_port(list_ports.comports(), self.selected, self.identity)
-            if port is None:
-                self.status.set("Waiting for USB printer...")
-                self.retry_at = time.monotonic() + 2
+        if self.active and self.proc is None and now >= self.retry_at:
+            ports = self._list_usb_ports()
+            if ports is None:
+                self.status.set("USB enumeration unavailable — retrying")
+                self.retry_at = now + 2
             else:
-                if self.identity is None:
-                    self.identity = port_identity(port)
-                self.launch(port.device)
+                port = select_com_port(ports, self.selected, self.identity)
+                if port is None:
+                    mismatch = reconnect_mismatch(ports, self.identity)
+                    if mismatch:
+                        self.status.set(mismatch)
+                        if mismatch != self.last_port_warning:
+                            self.log(mismatch)
+                            self.last_port_warning = mismatch
+                    else:
+                        self.status.set("Waiting for USB printer...")
+                        self.last_port_warning = None
+                    self.retry_at = now + 2
+                else:
+                    if self.identity is None:
+                        self.identity = port_identity(port)
+                    self.launch(port.device)
         if self.closing and self.proc is None:
             self.root.destroy()
             return
@@ -300,17 +451,23 @@ class BridgeWindow:
         ):
             return
         self.active = False
+        self.usb_missing_since = None
         self.start_button.configure(state="normal")
         self.stop_button.configure(state="disabled")
         self.status.set("Stopping...")
         self.log("Automatic reconnect disabled.")
         if self.proc is not None and self.proc.poll() is None:
-            try:
-                self.proc.stdin.write("STOP\n")
-                self.proc.stdin.flush()
-                self.stopping_at = time.monotonic()
-            except (OSError, ValueError):
-                self.proc.terminate()
+            if self.connected_at is None:
+                # During console login stdin is not a control channel yet:
+                # a literal STOP could be mistakenly submitted as a password.
+                terminate_owned_worker(self.proc)
+            else:
+                try:
+                    self.proc.stdin.write("STOP\n")
+                    self.proc.stdin.flush()
+                    self.stopping_at = time.monotonic()
+                except (OSError, ValueError, AttributeError):
+                    terminate_owned_worker(self.proc)
         else:
             self.status.set("Stopped")
 

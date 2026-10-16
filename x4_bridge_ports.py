@@ -47,5 +47,28 @@ def select_com_port(ports, preferred=None, identity=None):
     return matches[0] if len(matches) == 1 else None
 
 
+def reconnect_mismatch(ports, identity):
+    """Explain a changed USB identity without selecting an unknown device.
+
+    A no-serial-number CH340 can be replaced on the same COM name after
+    re-enumeration. In that ambiguous case, request a deliberate Stop / Start
+    rather than silently opening a potentially different physical device.
+    """
+    if identity is None:
+        return None
+    if any(is_same_device(p, identity) for p in ports):
+        return None
+    vid, pid, serial_number, location, previous_port = identity
+    for port in ports:
+        if port.device.casefold() == previous_port.casefold():
+            if (getattr(port, "vid", None), getattr(port, "pid", None)) != (vid, pid):
+                return "COM port now belongs to a different USB device"
+            if serial_number and getattr(port, "serial_number", None) != serial_number:
+                return "USB serial identity changed"
+            if location and getattr(port, "location", None) != location:
+                return "USB location changed; press Stop / Start to confirm"
+    return None
+
+
 def retry_seconds(attempt):
     return min(30, 2 ** min(max(attempt, 1), 4) * 2)

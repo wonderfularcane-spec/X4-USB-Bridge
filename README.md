@@ -2,7 +2,7 @@
 
 **Control an Artillery Sidewinder X4 Plus from OrcaSlicer using its USB-C serial connection — without Wi-Fi, LAN access or printer firmware changes.**
 
-> **Version status:** **v0.1** is the known-working Python prototype: the original tester reported a complete successful print on an X4 Plus. **v0.2.0-beta.3** adds a Windows GUI and a supervised reconnect mechanism, but physical USB unplug/replug is **not yet validated**. Do not assume v0.2 is production-ready.
+> **Version status:** **v0.1** is the known-working Python prototype: the original tester reported a complete successful print on an X4 Plus. **v0.2.0-beta.4** adds a Windows GUI and a supervised reconnect mechanism, but physical USB unplug/replug is **not yet validated**. Do not assume v0.2 is production-ready.
 
 ## Windows v0.2 portable preview (no Python required)
 
@@ -13,7 +13,7 @@
 5. Open Fluidd via the button, or use **127.0.0.1:8181** in OrcaSlicer as detailed below.
 6. The Stop button disconnects remote monitoring. A running print can continue after disconnection; do not use Stop as an emergency stop.
 
-The interface offers a status indicator, a log viewer, and recovery attempts after the serial link drops. It only reconnects to a matching USB device. Retries are rate-limited. If an old RAM-only printer relay still has the Linux tty in raw mode after a disconnect, the GUI waits and retries automatically rather than permanently disabling reconnection. A controlled worker-crash simulation has passed on an X4 Plus; a second physical unplug/replug test after this fix remains outstanding. The CLI version remains available for troubleshooting.
+The GUI monitors USB presence and receives a compact heartbeat from its worker. It retries after lost CH340 enumeration, a stalled serial process, or a temporarily busy Linux shell; retries are rate-limited. It closes only its own worker process tree and never stops a printer job. A CH340 without a unique USB serial number may change its USB location after reconnect: if the identity no longer matches, automatic connection is intentionally paused until the user explicitly confirms with Stop / Start. A controlled worker-crash simulation has passed; physical unplug/replug recovery with this newest monitor is not yet confirmed. The CLI version remains available for troubleshooting.
 
 **Important:** the GUI must be running to manage reconnections. When it is closed, the link stops. A printer on an unexpected Linux login prompt may require manual credentials; the GUI prompts without storing them.
 
@@ -147,7 +147,7 @@ On Windows x64 with Python 3.11 and an Internet connection for build dependencie
 py tools/build_windows.py
 ~~~
 
-The script creates an isolated build environment, generates both executables, tests their startup without accessing the printer, and packages them in `dist/X4-USB-Bridge-v0.2.0-beta.3-windows-x64.zip`. Build dependencies are pinned in `build-requirements.txt`.
+The script creates an isolated build environment, generates both executables, tests their startup without accessing the printer, and packages them in `dist/X4-USB-Bridge-v0.2.0-beta.4-windows-x64.zip`. Build dependencies are pinned in `build-requirements.txt`.
 
 See [CHANGELOG.md](CHANGELOG.md), [compatibility notes](docs/COMPATIBILITY.md), and the [hardware validation checklist](docs/RELEASE_VALIDATION.md). **Do not switch from the working v0.1 during an active print.**
 
