@@ -76,6 +76,7 @@ def handle(t,i,p):
         try:
             port=int(os.environ.get('X4_TARGET_PORT','80'))
             s=socket.create_connection(('127.0.0.1',port),2)
+            s.setsockopt(socket.IPPROTO_TCP,socket.TCP_NODELAY,1)
             s.setblocking(False)
             channels[i]=s
             reverse[s]=[i,bytearray()]
@@ -177,6 +178,29 @@ def pack_frame(kind, stream_id=0, payload=b""):
     return head + payload + CRC.pack(zlib.crc32(head + payload) & 0xffffffff)
 
 
+def serial_batches(kind, stream_id=0, payload=b"", frames_per_batch=8):
+    """Yield bounded writes without altering the frames or application data.
+
+    Multiple original X4B1 frames share one pyserial.write() syscall. Release
+    the serial lock between batches so monitoring/PING can interleave with a
+    long upload. No compression, HTTP parsing or G-code transformation.
+    """
+    if frames_per_batch < 1:
+        raise ValueError("frames_per_batch must be positive")
+    if not payload:
+        yield pack_frame(kind, stream_id)
+        return
+    mv = memoryview(payload)
+    stride = MAX_PAYLOAD * frames_per_batch
+    for base in range(0, len(mv), stride):
+        end = min(base + stride, len(mv))
+        write = bytearray()
+        for offset in range(base, end, MAX_PAYLOAD):
+            write.extend(pack_frame(kind, stream_id,
+                                    mv[offset:min(offset + MAX_PAYLOAD, end)]))
+        yield bytes(write)
+
+
 class FrameParser:
     def __init__(self):
         self.data = bytearray()
@@ -254,9 +278,17 @@ def login_if_needed(ser, username):
         ser.write(username.encode('utf-8') + b'\r')
         seen = read_for(ser, 3, b'Password:')
     if b'password:' in seen.lower():
-        password = (getpass.getpass("Mot de passe Linux de l'imprimante (non enregistre) : " )
-                    if sys.stdin.isatty() else 'makerbase')
+        if sys.stdin.isatty():
+            password = getpass.getpass("Mot de passe Linux de l'imprimante (non enregistre) : ")
+        else:
+            # GUI supplies a one-time password via stdin. Never guess factory
+            # credentials or expose a password in command-line arguments.
+            print('[X4_AUTH_REQUIRED]', flush=True)
+            password = sys.stdin.readline().rstrip('\r\n')
+        if not password:
+            raise RuntimeError('Authentification Linux annulee ou mot de passe vide.')
         ser.write(password.encode('utf-8') + b'\r')
+        password = None
         read_for(ser, 2.5)
         ok, more = shell_probe(ser)
         if ok:
@@ -311,12 +343,14 @@ class Session:
         if self.stop.is_set():
             return False
         try:
-            with self.lock:
-                if data:
-                    for i in range(0, len(data), MAX_PAYLOAD):
-                        self.ser.write(pack_frame(kind, sid, data[i:i+MAX_PAYLOAD]))
-                else:
-                    self.ser.write(pack_frame(kind, sid))
+            for batch in serial_batches(kind, sid, data):
+                if self.stop.is_set():
+                    return False
+                # Hold the lock only for one bounded UART write. This reduces
+                # pyserial overhead but keeps the monitoring channel responsive
+                # and preserves the original byte-for-byte frame format.
+                with self.lock:
+                    self.ser.write(batch)
             return True
         except Exception as exc:
             print('[ERREUR] Ecriture sur le port serie :', exc)
@@ -328,6 +362,7 @@ class Session:
             sid = self.counter
             self.counter += 1
             self.clients[sid] = channel
+        # Use the unchanged v0.1 connection mapping (nginx port 80).
         self.send(OPEN, sid)
         return sid
 
@@ -388,23 +423,45 @@ class ClientHandler(socketserver.BaseRequestHandler):
         self.request.settimeout(2)
         running = threading.Event()
         running.set()
+        upload_bytes = 0
+        first_upload = None
+        last_forwarded = None
+        first_response = None
+        write_eof_at = None
 
         def from_browser():
+            nonlocal upload_bytes, first_upload, last_forwarded, write_eof_at
+            peer_finished_writing = False
             try:
                 while running.is_set() and not bridge.stop.is_set():
                     try:
-                        data = self.request.recv(8192)
+                        data = self.request.recv(65536)
                     except socket.timeout:
                         continue
                     if not data:
+                        # TCP FIN only closes the client's sending direction.
+                        # Do not discard the pending HTTP response.
+                        peer_finished_writing = True
                         break
+                    if first_upload is None:
+                        first_upload = time.monotonic()
                     if not bridge.send(DATA, sid, data):
                         break
+                    upload_bytes += len(data)
+                    # Time of the last serial write, not HTTP completion.
+                    last_forwarded = time.monotonic()
             except (ConnectionError, OSError):
                 pass
             finally:
-                running.clear()
-                self.incoming.put((CLOSE, b''))
+                if peer_finished_writing and not bridge.stop.is_set():
+                    # HTTP messages have Content-Length / chunked framing.
+                    # The TCP FIN here is NOT forwarded to nginx: nginx may
+                    # treat a half-closed downstream as an aborted HTTP client.
+                    # Keep the response direction alive until upstream closes.
+                    write_eof_at = time.monotonic()
+                else:
+                    running.clear()
+                    self.incoming.put((CLOSE, b''))
 
         reader = threading.Thread(target=from_browser, daemon=True)
         reader.start()
@@ -413,13 +470,35 @@ class ClientHandler(socketserver.BaseRequestHandler):
                 try:
                     typ, data = self.incoming.get(timeout=1)
                 except queue.Empty:
+                    if write_eof_at is not None and time.monotonic() - write_eof_at > 180:
+                        print('[WARN] No upstream reply after client write EOF; closing stale tunnel.')
+                        break
                     continue
                 if typ == DATA:
+                    if first_response is None:
+                        first_response = time.monotonic()
                     self.request.sendall(data)
                 elif typ == ERROR:
-                    print('[WARN] Ouverture refusee par nginx sur l\'imprimante :', data.decode('utf-8', 'replace'))
+                    print('[WARN] Connexion HTTP refusee sur l\'imprimante :',
+                          data.decode('utf-8', 'replace'))
+                    if first_response is None:
+                        self.request.sendall(
+                            b'HTTP/1.1 502 Bad Gateway\r\n'
+                            b'Content-Length: 0\r\n'
+                            b'Connection: close\r\n\r\n'
+                        )
                     break
                 else:
+                    # An upstream connection can close before delivering any
+                    # HTTP response. Report an explicit gateway failure instead
+                    # of curl 52 / an ambiguous empty reply. No application
+                    # payloads are changed when upstream actually replies.
+                    if first_response is None:
+                        self.request.sendall(
+                            b'HTTP/1.1 502 Bad Gateway\r\n'
+                            b'Content-Length: 0\r\n'
+                            b'Connection: close\r\n\r\n'
+                        )
                     break
         except (ConnectionError, OSError):
             pass
@@ -431,6 +510,27 @@ class ClientHandler(socketserver.BaseRequestHandler):
             except OSError:
                 pass
             reader.join(timeout=0.2)
+            if first_upload is not None and upload_bytes >= 128 * 1024:
+                # Distinguish time blocked on UART from HTTP response latency.
+                # These counters do NOT prove Moonraker saved the file.
+                serial_elapsed = max(
+                    (last_forwarded or time.monotonic()) - first_upload, 0.001
+                )
+                wait_after_forward = (
+                    max(first_response - last_forwarded, 0.0)
+                    if first_response is not None and last_forwarded is not None
+                    else None
+                )
+                print(
+                    '[USB STATS] UART forwarded %.2f MiB in %.1fs (%.1f KiB/s); '
+                    'response wait %s; response_received=%s' %
+                    (upload_bytes / (1024 * 1024), serial_elapsed,
+                     upload_bytes / 1024 / serial_elapsed,
+                     ('%.1fs' % wait_after_forward)
+                     if wait_after_forward is not None else 'n/a',
+                     first_response is not None),
+                    flush=True,
+                )
 
 
 class LocalServer(socketserver.ThreadingTCPServer):
@@ -439,20 +539,39 @@ class LocalServer(socketserver.ThreadingTCPServer):
     request_queue_size = 64
 
 
+def serve_until_stopped(server, bridge, control_stop=None):
+    """Run socket accept loop until USB link fails or the GUI requests stop.
+
+    serve_forever() would otherwise keep listening after a lost COM port,
+    preventing a supervising launcher from restarting the bridge.
+    """
+    server.timeout = 0.35
+    while not bridge.stop.is_set() and (
+        control_stop is None or not control_stop.is_set()
+    ):
+        server.handle_request()
+
+
 def main():
+    # Frozen console apps launched with hidden Windows pipes may default to
+    # cp1252. Keep the GUI subprocess protocol and help output UTF-8.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(description='Pont USB Artillery X4 → Fluidd/Moonraker pour OrcaSlicer')
     ap.add_argument('--com', default='COM3', help='Port serie physique Windows (defaut: COM3)')
     ap.add_argument('--baud', type=int, default=1500000, help='Debit UART (defaut: 1500000)')
     ap.add_argument('--port', type=int, default=8181, help='Port HTTP local (defaut: 8181)')
     ap.add_argument('--user', default='mks', help='Compte Linux sur l\'imprimante (defaut: mks)')
     ap.add_argument('--probe-only', action='store_true', help='Tester uniquement la console et nginx/Moonraker (aucun relais)')
+    ap.add_argument('--control-stdin', action='store_true')
     args = ap.parse_args()
     if serial is None:
         ap.error('pyserial manquant : executez "py -m pip install pyserial" sous Windows.')
     ser = None
     bridge = None
     try:
-        print('X4 USB Bridge v0.1 - prototype experimental')
+        print('X4 USB Bridge v0.2-dev - prototype experimental')
         print('Fermer PuTTY et HW VSP3 avant de lancer la connexion COM.')
         ser = serial.Serial(args.com, baudrate=args.baud, timeout=0.1,
                             write_timeout=8, xonxoff=False, rtscts=False, dsrdtr=False)
@@ -468,10 +587,20 @@ def main():
         bridge = Session(ser)
         with LocalServer(('127.0.0.1', args.port), ClientHandler) as server:
             server.bridge = bridge
-            print('[OK] Tunnel actif : http://127.0.0.1:%d' % args.port)
+            print('[OK] Tunnel actif : http://127.0.0.1:%d' % args.port, flush=True)
             print('OrcaSlicer : Host Type=Octo/Klipper, adresse=127.0.0.1:%d' % args.port)
             print('Tester /server/info dans le navigateur, puis Fluidd. Ctrl+C pour arreter.')
-            server.serve_forever(poll_interval=0.25)
+            control_stop = threading.Event()
+            if args.control_stdin:
+                def stdin_control():
+                    while not control_stop.is_set():
+                        line = sys.stdin.readline()
+                        if not line or line.strip().upper() == 'STOP':
+                            control_stop.set()
+                            break
+                threading.Thread(target=stdin_control, daemon=True,
+                                 name='gui-stdin-control').start()
+            serve_until_stopped(server, bridge, control_stop)
     except KeyboardInterrupt:
         print('\nArret demande.')
     except Exception as exc:

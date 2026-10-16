@@ -2,7 +2,20 @@
 
 **Control an Artillery Sidewinder X4 Plus from OrcaSlicer using its USB-C serial connection — without Wi-Fi, LAN access or printer firmware changes.**
 
-> **Experimental v0.1 prototype:** verified on one printer and PC, not yet a fully supported release. Supervise printing and review the limitations before use.
+> **Version status:** **v0.1** is the known-working Python prototype: the original tester reported a complete successful print on an X4 Plus. **v0.2.0-beta.1** adds a Windows GUI and a supervised reconnect mechanism, but physical USB unplug/replug is **not yet validated**. Do not assume v0.2 is production-ready.
+
+## Windows v0.2 portable preview (no Python required)
+
+1. Download the prerelease ZIP from [GitHub Releases](https://github.com/wonderfularcane-spec/X4-USB-Bridge/releases) (available to users with access to the repository).
+2. Extract it somewhere writable on Windows. Keep **X4_USB_Bridge.exe** and **X4_USB_Bridge_Worker.exe** in the same folder.
+3. Close PuTTY, HW VSP3, and any earlier bridge process that holds COM3. Ensure the printer is idle before replacing a working connection.
+4. Open **X4_USB_Bridge.exe**, select the CH340 serial port (or auto-detect), then click **Start / auto-reconnect**.
+5. Open Fluidd via the button, or use **127.0.0.1:8181** in OrcaSlicer as detailed below.
+6. The Stop button disconnects remote monitoring. A running print can continue after disconnection; do not use Stop as an emergency stop.
+
+The interface offers a status indicator, a log viewer, and recovery attempts after the serial link drops. It only reconnects to a matching USB device. Retries are rate-limited. The CLI version remains available for troubleshooting.
+
+**Important:** the GUI must be running to manage reconnections. When it is closed, the link stops. A printer on an unexpected Linux login prompt may require manual credentials; the GUI prompts without storing them.
 
 ## How it works
 
@@ -26,6 +39,8 @@ nginx :80 -> Fluidd / Moonraker :7125
 
 The bridge runs on Windows. It launches a small in-memory Python relay through the existing printer Linux console. **No firmware flash, printer-side package installation or permanent printer file changes are required.**
 
+**Data integrity:** OrcaSlicer's HTTP requests, WebSocket messages and G-code bytes are forwarded unchanged. The v0.2 beta batches existing serial packets to reduce write overhead, but never compresses, rewrites, interprets or recompresses G-code. The zlib library in the source is used only for temporary relay startup and CRC checksum calculation.
+
 ## Real-world validation (2026-10-16)
 
 Tests were performed on Windows (Python 3.11.9), an Artillery Sidewinder X4 Plus and its USB-C CH340 port.
@@ -38,19 +53,22 @@ Tests were performed on Windows (Python 3.11.9), an Artillery Sidewinder X4 Plus
 | WebSocket | 101 upgrade plus successful JSON-RPC server.info reply |
 | Temperatures, console, bed mesh | Visible inside OrcaSlicer |
 | OrcaSlicer print-host test | Passed |
-| Sliced G-code upload / print start | User confirmed correct job loaded and heating began |
-| Full-print completion, long-run reliability and reconnect | **Not independently verified** |
+| Sliced G-code upload / print start | Correct job loaded and heating began |
+| Completed physical print | Original tester confirmed a successful complete print using v0.1 |
+| Long-run reliability and USB unplug/replug recovery | **Not yet validated** |
 
 This USB approach does not require the PC and printer to share a network.
 
 ## Requirements
 
-- Windows and Python **3.9 or newer**, with pyserial.
+- Windows x64. The portable v0.2 ZIP includes its own Python runtime and does **not** require a separate Python installation. For source-code CLI use Python **3.9 or newer** with pyserial.
 - Artillery Sidewinder X4 Plus with a CH340 Linux console accessible from its USB-C port.
 - Stock printer Linux with Python 3 and nginx serving Fluidd and proxying Moonraker. Other firmware and models are not guaranteed compatible.
 - Linux login credentials if the printer's console is not already logged in.
 
-## Quick start on Windows
+## Source-code CLI quick start (v0.1 workflow)
+
+Use this if you prefer Python rather than the portable graphical v0.2 preview.
 
 1. Connect a **PC USB port to the printer's USB-C device port**. Never use an unsafe USB-A-to-USB-A cable to connect two host ports.
 2. In Device Manager, find the real USB-SERIAL CH340 (COMx) port. **Close PuTTY and HW VSP3** before starting: COM3 can only be used by one application at a time.
@@ -95,11 +113,20 @@ This checks the Linux console and internal nginx/Moonraker HTTP endpoints; it do
 
 ## Current limitations and safety
 
-- Automatic reconnect, hard disconnect recovery, prolonged usage and high-volume throughput are not yet qualified.
+- Automatic reconnect, hard disconnect recovery, prolonged usage and high-volume throughput are not yet qualified. v0.2 includes fixes for premature HTTP reply closure and serial-write overhead; these must be validated on hardware before claiming a real transfer-speed improvement. UART at 1,500,000 baud in 8N1 has an approximate physical maximum of 150 kB/s before protocol overhead, regardless of host optimizations.
 - Disconnecting USB or stopping the bridge breaks the remote connection; it does **not** ensure that an already-started print will stop. Use printer hardware controls and supervise first prints.
 - The Windows listener binds to **127.0.0.1 only**. Other programs **on the same PC** may still access Moonraker and issue real machine commands. Do not expose port 8181 to the LAN or Internet, or use on untrusted computers.
-- Factory Linux login credentials should be changed where possible. The current prototype may try a manufacturer default when running non-interactively; never put actual passwords in issues or logs.
+- Factory Linux login credentials should be changed where possible. The v0.2 GUI asks when the console requires login and does not store the value; avoid putting any credentials in issue reports or logs.
 - Other printers, baud rates and Linux environments have not been tested.
+- Uploads can fail for **printer-side HTTP limits** (for example nginx
+  `client_max_body_size`) or during Moonraker metadata extraction. A 413
+  response indicates a rejected HTTP request, not necessarily corrupt G-code.
+  The actual nginx limit on every model/firmware is **not known**; this tool
+  does not change printer configuration. If nginx closes before replying,
+  v0.2 reports 502 rather than silently returning zero bytes.
+- Timings in the GUI log distinguish **USB forwarding time** from **HTTP response
+  latency**. Neither is proof of a completed upload; rely on Moonraker's
+  success response and a checksum-verified read-back where applicable.
 
 ## Offline tests
 
@@ -107,7 +134,22 @@ This checks the Linux console and internal nginx/Moonraker HTTP endpoints; it do
 py -m unittest discover -s tests -v
 ~~~
 
-The unit tests check binary framing, fragmentation, CRC recovery and syntax; they never open COM3 or issue G-code.
+The offline tests check framing, fragmentation, CRC recovery, port matching,
+reconnect backoff, GUI command construction, TCP half-close, HTTP errors,
+a 2 MiB `Expect: 100-continue` upload, byte-for-byte identity and shutdown.
+They do not open COM3 or issue G-code.
+
+### Build the portable Windows executables
+
+On Windows x64 with Python 3.11 and an Internet connection for build dependencies:
+
+~~~powershell
+py tools/build_windows.py
+~~~
+
+The script creates an isolated build environment, generates both executables, tests their startup without accessing the printer, and packages them in `dist/X4-USB-Bridge-v0.2.0-beta.1-windows-x64.zip`. Build dependencies are pinned in `build-requirements.txt`.
+
+See [CHANGELOG.md](CHANGELOG.md), [compatibility notes](docs/COMPATIBILITY.md), and the [hardware validation checklist](docs/RELEASE_VALIDATION.md). **Do not switch from the working v0.1 during an active print.**
 
 ## Contributions
 

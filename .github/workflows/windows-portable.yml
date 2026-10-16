@@ -1,0 +1,29 @@
+name: Windows portable beta
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v0.2.*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Offline protocol and reconnect tests
+        run: python -m unittest discover -s tests -v
+      - name: Build portable GUI and worker
+        run: python tools/build_windows.py
+      - name: Store Windows beta ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: X4-USB-Bridge-Windows-x64
+          path: dist/X4-USB-Bridge-v0.2.0-beta.1-windows-x64.zip
+          if-no-files-found: error
